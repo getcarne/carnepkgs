@@ -1,0 +1,284 @@
+name: pr
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Carne
+        uses: getcarne/action@main
+
+      - name: Validate packages.json and changed packages
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          BASE="$(git merge-base origin/main HEAD 2>/dev/null || true)"
+          if [ -z "$BASE" ]; then
+            BASE="origin/main"
+          fi
+          export BASE
+          echo "Base: $BASE"
+          echo "Head: $(git rev-parse HEAD)"
+
+          # --- 1. PR scope: a PR touching packages.json must touch only it ---
+          CHANGED_FILES="$(git diff --name-only "$BASE" HEAD --)"
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+          NO_PKG_CHANGE=0
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if ! grep -qx "packages.json" <<< "$CHANGED_FILES"; then
+              echo "No packages.json change; registry integrity check only."
+              NO_PKG_CHANGE=1
+            else
+              while IFS= read -r f; do
+                [ -z "$f" ] && continue
+                if [ "$f" != "packages.json" ]; then
+                  echo "::error::Registry PRs must only change packages.json (found: $f)"
+                  exit 1
+                fi
+              done <<< "$CHANGED_FILES"
+            fi
+          fi
+          export NO_PKG_CHANGE
+
+          # --- 2. packages.json validation + changed-package detection ---
+          python3 - <<'PYEOF'
+          import json, os, re, subprocess, sys
+
+          SEMVER_RE = re.compile(
+              r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+              r"(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?"
+              r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+          )
+
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+          try:
+              with open("packages.json", encoding="utf-8") as f:
+                  head = json.load(f)
+          except FileNotFoundError:
+              fail("packages.json not found")
+          except json.JSONDecodeError as e:
+              fail(f"packages.json is not valid JSON: {e}")
+          except OSError as e:
+              fail(f"could not read packages.json: {e}")
+
+          if not isinstance(head, list):
+              fail("packages.json top level must be an array")
+
+          REQUIRED = ("name", "url", "method", "tags", "description", "license", "web")
+          names = []
+          for i, entry in enumerate(head):
+              where = f"packages.json[{i}]"
+              if not isinstance(entry, dict):
+                  fail(f"{where} must be an object")
+              for field in REQUIRED:
+                  if field not in entry:
+                      fail(f"{where} is missing required field \"{field}\"")
+              name = entry["name"]
+              if not isinstance(name, str) or not name.strip():
+                  fail(f"{where}.name must be a non-empty string")
+              # npm new-package rules, mirroring carne pkgmanifest.validateName
+              if len(name) > 214:
+                  fail(f"{where}.name exceeds 214 characters")
+              if name[0] in (".", "_"):
+                  fail(f"{where}.name cannot start with '.' or '_'")
+              if name.startswith("@"):
+                  fail(f"{where}.name: scoped packages are not supported")
+              if name != name.lower():
+                  fail(f"{where}.name must be lowercase")
+              for c in name:
+                  if c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ ~'!()* /\"\\":
+                      fail(f"{where}.name contains an invalid character: '{c}'")
+                  if ord(c) < 0x20 or ord(c) == 0x7F:
+                      fail(f"{where}.name contains a control character")
+              url = entry["url"]
+              if not isinstance(url, str) or not url.strip():
+                  fail(f"{where}.url must be a non-empty string")
+              u = url.strip()
+              if not u.startswith("https://"):
+                  fail(f"{where}.url must be an https:// URL (got: {url})")
+              if any(ch.isspace() for ch in u):
+                  fail(f"{where}.url must not contain whitespace")
+              authority = u[len("https://"):].split("/", 1)[0]
+              if "@" in authority:
+                  fail(f"{where}.url must not embed credentials")
+              if entry["method"] != "git":
+                  fail(f"{where}.method must be \"git\"")
+              tags = entry["tags"]
+              if not isinstance(tags, list) or len(tags) == 0:
+                  fail(f"{where}.tags must be a non-empty array")
+              seen_tags = set()
+              for t in tags:
+                  if not isinstance(t, str) or not t.strip():
+                      fail(f"{where}.tags must list non-empty strings")
+                  if any(ch.isspace() for ch in t) or "," in t:
+                      fail(f"{where}.tags entry must not contain whitespace or commas: '{t}'")
+                  if t in seen_tags:
+                      fail(f"{where}.tags contains duplicate '{t}'")
+                  seen_tags.add(t)
+              for field in ("description", "license", "web"):
+                  v = entry[field]
+                  if not isinstance(v, str) or not v.strip():
+                      fail(f"{where}.{field} must be a non-empty string")
+              web = entry["web"].strip()
+              if not (web.startswith("https://") or web.startswith("http://")):
+                  fail(f"{where}.web must be an http(s) URL")
+              names.append(name)
+
+          if len(set(names)) != len(names):
+              dupes = sorted(n for n in set(names) if names.count(n) > 1)
+              fail(f"duplicate package names: {', '.join(dupes)}")
+          if names != sorted(names):
+              fail("packages.json entries must be sorted by name")
+
+          base_ref = os.environ.get("BASE", "origin/main")
+          try:
+              proc = subprocess.run(["git", "show", f"{base_ref}:packages.json"],
+                                    capture_output=True, text=True)
+              base = json.loads(proc.stdout) if proc.returncode == 0 else []
+          except Exception:
+              base = []
+          if not isinstance(base, list):
+              base = []
+          base_map = {e["name"]: e for e in base
+                      if isinstance(e, dict) and isinstance(e.get("name"), str)}
+          head_map = {e["name"]: e for e in head
+                      if isinstance(e, dict) and isinstance(e.get("name"), str)}
+
+          event = os.environ.get("EVENT_NAME", "pull_request")
+          no_pkg_change = os.environ.get("NO_PKG_CHANGE", "0") == "1"
+          if event == "pull_request" and no_pkg_change:
+              changed = []
+          elif event != "pull_request":
+              changed = sorted(head_map)
+          else:
+              changed = sorted(n for n in head_map
+                               if n not in base_map or base_map[n] != head_map[n])
+
+          with open("/tmp/changed_pkgs.txt", "w", encoding="utf-8") as f:
+              for n in changed:
+                  f.write(n + "\n")
+          print(f"Changed packages: {changed if changed else 'none'}")
+          PYEOF
+
+          if [ "$NO_PKG_CHANGE" = "1" ]; then
+            echo "Nothing further to check."
+            exit 0
+          fi
+
+          if [ ! -s /tmp/changed_pkgs.txt ]; then
+            echo "No added or modified packages; done."
+            exit 0
+          fi
+
+          # --- 3. Per-package validation ---
+          while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            echo "::group::Validating package $name"
+            export PKG_NAME="$name"
+            url="$(python3 -c 'import json, os; print([e["url"] for e in json.load(open("packages.json")) if e["name"] == os.environ["PKG_NAME"]][0])')"
+            echo "URL: $url"
+
+            # tags already checked non-empty above; connectivity first
+            git ls-remote "$url" HEAD
+
+            # semver tag required (0.1.0 or v0.1.0 style)
+            if ! git ls-remote --tags "$url" | awk '{print $2}' \
+                | sed -e 's|^refs/tags/||' -e 's/\^{}$//' | sort -u \
+                | python3 -c 'import re, sys
+          SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$")
+          found = False
+          for line in sys.stdin:
+              t = line.strip()
+              if not t:
+                  continue
+              v = t[1:] if t.startswith("v") else t
+              if SEMVER_RE.match(v):
+                  found = True
+                  print(f"semver tag: {t}")
+                  break
+          sys.exit(0 if found else 1)'; then
+              echo "::error::$name: no semver tag found (push 0.1.0 or v0.1.0)"
+              exit 1
+            fi
+
+            CLONE="$(mktemp -d)/pkg"
+            git clone --quiet "$url" "$CLONE"
+            export CLONE_DIR="$CLONE" EXPECTED_NAME="$name"
+            python3 - <<'PYEOF'
+          import json, os, re, sys
+          SEMVER_RE = re.compile(
+              r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+              r"(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?"
+              r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+          )
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+          d = os.environ["CLONE_DIR"]
+          exp = os.environ["EXPECTED_NAME"]
+          try:
+              with open(os.path.join(d, "package.json"), encoding="utf-8") as f:
+                  m = json.load(f)
+          except FileNotFoundError:
+              fail(f"{exp}: repo has no package.json at root")
+          except json.JSONDecodeError as e:
+              fail(f"{exp}: package.json is not valid JSON: {e}")
+          if not isinstance(m, dict):
+              fail(f"{exp}: package.json top level must be an object")
+          for field in ("name", "version", "description", "license"):
+              if field not in m:
+                  fail(f"{exp}: package.json is missing \"{field}\"")
+          pname = m["name"]
+          if not isinstance(pname, str) or pname != exp:
+              fail(f"{exp}: registry name does not match package.json name '{m.get('name')}'")
+          version = m["version"]
+          if not isinstance(version, str) or not SEMVER_RE.match(version.strip()):
+              fail(f"{exp}: version must be exact semver (got '{m.get('version')}')")
+          for field in ("description", "license"):
+              if not isinstance(m[field], str) or not m[field].strip():
+                  fail(f"{exp}: package.json \"{field}\" must be a non-empty string")
+          print(f"{exp}: manifest ok ({pname}@{version.strip()})")
+          PYEOF
+
+            # install by URL proves the repo is consumable
+            carne pkg install "$url"
+
+            # smoke: the package must load via require("pkg/<name>")
+            SMOKE="$(mktemp /tmp/smoke-XXXXXX.js)"
+            printf 'const pkg = require("pkg/%s");\nconsole.log("smoke ok");\n' "$name" > "$SMOKE"
+            carne run "$SMOKE"
+
+            # tests are mandatory and must pass
+            if [ -z "$(find "$CLONE/tests" -name '*.test.js' 2>/dev/null || true)" ]; then
+              echo "::error::$name: no tests found (tests/**/*.test.js is required)"
+              exit 1
+            fi
+            (cd "$CLONE" && carne test)
+            echo "::endgroup::"
+          done < /tmp/changed_pkgs.txt
+
+          echo "All changed packages validated."
