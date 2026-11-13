@@ -1,1 +1,47 @@
-[]
+[
+  {
+    "name": "concarne",
+    "url": "https://github.com/getcarne/concarne",
+    "method": "git",
+    "tags": [
+      "carne",
+      "http",
+      "framework",
+      "express",
+      "server",
+      "powpow"
+    ],
+    "description": "Express-like web application framework for Carne",
+    "license": "MIT",
+    "web": "https://github.com/getcarne/concarne"
+  },
+  {
+    "name": "flysystem",
+    "url": "https://github.com/getcarne/flysystem",
+    "method": "git",
+    "tags": [
+      "carne",
+      "filesystem",
+      "storage",
+      "local"
+    ],
+    "description": "Sandboxed local filesystem for Carne: atomic writes, visibility, policies and multi-disk facade",
+    "license": "MIT",
+    "web": "https://github.com/getcarne/flysystem"
+  },
+  {
+    "name": "logs",
+    "url": "https://github.com/getcarne/logs",
+    "method": "git",
+    "tags": [
+      "carne",
+      "logger",
+      "logging",
+      "json",
+      "structured"
+    ],
+    "description": "Structured JSON and pretty logger for Carne",
+    "license": "MIT",
+    "web": "https://github.com/getcarne/logs"
+  }
+]
